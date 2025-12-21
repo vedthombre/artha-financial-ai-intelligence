@@ -1,0 +1,11 @@
+# Ignore API Keys
+.env
+
+# Ignore Python Cache
+__pycache__/
+*.pyc
+
+# Ignore Database & Temp Files
+chroma_db/
+temp_pdf/
+doc_log.txt

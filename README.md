@@ -34,7 +34,7 @@ Unlike traditional RAG systems that fail when data is missing, Artha features a 
 1. **Clone the repository**
    ```bash
    git clone [https://github.com/YOUR_USERNAME/artha-financial-ai.git](https://github.com/YOUR_USERNAME/artha-financial-ai.git)
-   cd artha-financial-ai
+   cd artha-financial-ai-intelligence 
 
 2. **Install Dependencies**
 ```bash 

@@ -7,7 +7,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
 from typing import List, TypedDict
@@ -15,18 +15,18 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-# --- 1. STATE DEFINITION (Fixed) ---
+# --- 1. STATE DEFINITION (Added sub_queries) ---
 class GraphState(TypedDict):
     question: str
+    sub_queries: List[str]  # <--- NEW: Holds broken-down questions
     generation: str
-    web_search: str         # "Yes" or "No"
+    web_search: str
     documents: List[Document]
     file_filter: str
-    loop_count: int         # Prevents infinite loops
+    loop_count: int
 
 # --- 2. SETUP ---
-print("--- INITIALIZING AGENT ---")
-# Using the NEW reliable model
+print("--- INITIALIZING AGENT (Phase 1: Decomposition) ---")
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
@@ -40,117 +40,142 @@ web_search_tool = TavilySearchResults(k=3)
 
 # --- 3. NODES ---
 
-def retrieve(state):
-    print("---RETRIEVE---")
+def decompose_query(state):
+    """
+    Breaks down complex questions into sub-queries.
+    Example: "Compare Apple and Microsoft Revenue" -> ["Apple Revenue 2023", "Microsoft Revenue 2023"]
+    """
+    print("---DECOMPOSE QUERY---")
     question = state["question"]
+    
+    # Simple JSON parser for robustness
+    parser = JsonOutputParser()
+    
+    prompt = ChatPromptTemplate.from_template(
+        """You are a Query Decomposition Engine.
+        Analyze the user's question.
+        
+        1. If it involves **comparison** (e.g., "Apple vs Microsoft"), break it into 2 distinct sub-queries.
+        2. If it is a **single entity** question (e.g., "What is Apple's revenue?"), return just the original question.
+        3. Optimize queries for vector search (remove fluff words).
+        
+        Return JSON format: {{ "queries": ["query 1", "query 2"] }}
+        
+        Question: {question}
+        """
+    )
+    
+    chain = prompt | llm | parser
+    
+    try:
+        result = chain.invoke({"question": question})
+        sub_queries = result.get("queries", [question])
+        print(f"   -> Generated Sub-Queries: {sub_queries}")
+    except:
+        # Fallback if JSON fails
+        sub_queries = [question]
+        
+    return {"sub_queries": sub_queries, "question": question}
+
+def retrieve(state):
+    """
+    Retrieves documents for EACH sub-query and combines them.
+    This ensures we get data for BOTH entities in a comparison.
+    """
+    print("---RETRIEVE (MULTI-STEP)---")
+    sub_queries = state["sub_queries"]
     file_filter = state.get("file_filter", "All Documents")
     loop_count = state.get("loop_count", 0)
     
-    # Use larger K to ensure we catch financial tables
-    k_depth = 8
+    all_documents = []
     
-    if file_filter and file_filter != "All Documents":
-        documents = vectorstore.similarity_search(
-            question, k=k_depth, filter={"source": file_filter}
-        )
-    else:
-        documents = vectorstore.similarity_search(question, k=k_depth)
+    # We use a smaller K because we are running multiple searches
+    # Total chunks = (Number of queries) * k_per_query
+    # 2 queries * 3 chunks = 6 chunks total (Safe for Rate Limits)
+    k_per_query = 3 
+    
+    for query in sub_queries:
+        print(f"   -> Searching for: '{query}'")
+        if file_filter and file_filter != "All Documents":
+            docs = vectorstore.similarity_search(query, k=k_per_query, filter={"source": file_filter})
+        else:
+            docs = vectorstore.similarity_search(query, k=k_per_query)
+        all_documents.extend(docs)
         
-    return {"documents": documents, "question": question, "file_filter": file_filter, "loop_count": loop_count}
+    # Deduplicate documents (in case sub-queries overlap)
+    unique_docs = []
+    seen_content = set()
+    for doc in all_documents:
+        if doc.page_content not in seen_content:
+            unique_docs.append(doc)
+            seen_content.add(doc.page_content)
+            
+    print(f"   -> Total Unique Docs Retrieved: {len(unique_docs)}")
+    return {"documents": unique_docs, "loop_count": loop_count}
 
 def grade_documents(state):
     print("---CHECK RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
     
-    # Structured Output Wrapper
-    class Grade(BaseModel):
-        binary_score: str = Field(description="Relevance score 'yes' or 'no'")
-
-    structured_llm_grader = llm.with_structured_output(Grade)
+    # We can skip strict Pydantic grading for now to save API calls (Rate Limit Optimization)
+    # Or keep a lightweight check. Let's do a quick check.
     
-    # --- CORRECTED PROMPT FOR DOCUMENT GRADING ---
-    system = """You are a grader assessing relevance of a retrieved document to a user question.
-    
-    1. If the document contains keywords or semantic meaning related to the question, grade it as "yes".
-    2. **EXCEPTION:** If the user specifically asks for "LIVE" data (e.g., "live stock price", "today's news") and the document is an old PDF, grade it as "no" so the system searches the web.
-    
-    Give a binary score 'yes' or 'no'."""
-    
-    grade_prompt = ChatPromptTemplate.from_messages([
-        ("system", system),
-        ("human", "Retrieved document: \n\n {document} \n\n User question: {question}"),
-    ])
-    
-    retrieval_grader = grade_prompt | structured_llm_grader
-    
+    # Simplified Grader for speed
     filtered_docs = []
     web_search = "No"
     
-    for d in documents:
-        score = retrieval_grader.invoke({"question": question, "document": d.page_content})
-        if score.binary_score.lower() == "yes":
-            filtered_docs.append(d)
+    # If we have NO docs, definitely search web
+    if not documents:
+        print("   -> No docs found. Web Search needed.")
+        return {"documents": [], "web_search": "Yes"}
+
+    # Optimization: Just assume top docs are relevant if we did Decomposition
+    # This saves N LLM calls for grading.
+    # But if user asked for "Live Stock", we must check.
     
-    # If all docs are irrelevant (or it's a Live Data request), force Web Search
-    if len(filtered_docs) == 0:
-        print("   -> GRADE: Irrelevant/Missing Live Data. Web Search Needed.")
-        web_search = "Yes"
-    else:
-        print("   -> GRADE: Relevant. Proceeding.")
-        
-    return {"documents": filtered_docs, "question": question, "web_search": web_search}
+    if "live" in question.lower() or "stock price" in question.lower() or "today" in question.lower():
+        # Check if any doc is from Web
+        has_web = any("Live Web" in d.metadata.get("source", "") for d in documents)
+        if not has_web:
+             web_search = "Yes"
+             
+    return {"documents": documents, "question": question, "web_search": web_search}
 
 def transform_query(state):
-    """Optimizes query for Google Search"""
     print("---TRANSFORM QUERY---")
     question = state["question"]
-    
-    # Simple re-writer
+    # Re-write for Google
     msg = [("human", f"Refine this query for a Google search to find missing financial data: {question}")]
     better_question = llm.invoke(msg).content
-    
     return {"question": better_question}
 
 def web_search_node(state):
-    """Hybrid Search: Appends Web Data to PDF Data"""
     print("---WEB SEARCH---")
     question = state["question"]
     documents = state.get("documents", [])
     loop_count = state.get("loop_count", 0)
     
-    # 1. Fetch from Tavily
     try:
         docs = web_search_tool.invoke({"query": question})
         web_content = ""
-        
-        # Parse safely
         if isinstance(docs, list):
             for d in docs:
                 content = d.get('content', '') if isinstance(d, dict) else str(d)
                 web_content += f"\n[Source: Live Web] {content}"
         else:
             web_content = str(docs)
-            
     except Exception as e:
         web_content = f"Web search failed: {e}"
     
-    # 2. Create Web Document
     web_doc = Document(page_content=web_content, metadata={"source": "Live Web Search"})
     
-    # 3. Append to existing documents (Hybrid approach)
     if documents is None:
         documents = [web_doc]
     else:
         documents.append(web_doc)
-    
-    # 4. Increment loop count
-    return {
-        "documents": documents, 
-        "question": question, 
-        "web_search": "Done",
-        "loop_count": loop_count + 1 
-    }
+        
+    return {"documents": documents, "web_search": "Done", "loop_count": loop_count + 1}
 
 def generate(state):
     print("---GENERATE---")
@@ -158,17 +183,35 @@ def generate(state):
     documents = state["documents"]
     loop_count = state.get("loop_count", 0)
     
-    # Format Context
-    context_text = "\n\n".join([f"{d.page_content} \n[Source: {d.metadata.get('source', 'Unknown')}]" for d in documents])
+    # Truncate context
+    full_context = "\n\n".join([f"Source: [{d.metadata.get('source', 'Unknown')}]\nContent: {d.page_content}" for d in documents])
+    truncated_context = full_context[:12000] 
     
-    # Prompt
     prompt = ChatPromptTemplate.from_template(
-        """You are a Senior Financial Analyst.
+        """You are a Senior Financial Analyst "Arth".
         
         ### INSTRUCTIONS:
-        1. Use BOTH the PDF context and Live Web Search results to answer.
-        2. If the user asks for "Sales and Stock Price", combine the data from both sources.
-        3. Citation is MANDATORY: [Page 22] or [Live Web Search].
+        1. **Deep Comparison:** If comparing, explicitly contrast numbers (e.g., "Apple: $X vs Microsoft: $Y").
+        2. **Use the Context:** Answer strictly based on the provided text.
+        3. **Missing Data:** If a number is missing, check if [Live Web Search] data is available. If not, state "Data missing."
+        4. **Formatting:** Use proper spacing. Do NOT mash words together. Use Markdown tables.
+        5. **NO DOLLAR SIGNS:** Do NOT use the "$" symbol. Always use "USD" or "dollars" (e.g. "100 million USD"). The "$" symbol crashes the text formatting.
+    
+        
+        ### VISUALIZATION REQUEST:
+        If the answer involves comparing numbers (e.g., Revenue A vs B) or trends (e.g., 2022-2024), you MUST append a JSON block at the very end.
+        
+        Format exactly like this:
+        ```json
+        {{
+            "bar_chart": {{
+                "labels": ["Apple", "Microsoft"],
+                "datasets": [
+                    {{ "label": "Revenue (Billions)", "data": [383, 211] }}
+                ]
+            }}
+        }}
+        ```
         
         ### CONTEXT:
         {context}
@@ -180,36 +223,36 @@ def generate(state):
     )
     
     chain = prompt | llm | StrOutputParser()
-    generation = chain.invoke({"context": context_text, "question": question})
+    generation = chain.invoke({"context": truncated_context, "question": question})
     
     return {"generation": generation, "loop_count": loop_count}
 
-# --- 4. VALIDATOR (The Safety Net) ---
 def check_hallucination(state):
-    """Checks if the answer is 'I don't know' and triggers a retry."""
-    print("---CHECKING ANSWER VALIDITY---")
+    print("---CHECK VALIDITY---")
     generation = state["generation"]
     web_search = state.get("web_search", "No")
     loop_count = state.get("loop_count", 0)
     
-    # Expanded list of failure phrases
+    # --- AGGRESSIVE FAILURE DETECTION ---
+    # If ANY of these are found, we force a Web Search
     failure_phrases = [
-        "context does not provide", "not provided in the context", 
-        "cannot accurately calculate", "information is not available",
-        "context missing", "publicly available information",
-        "i do not have access", "undisclosed"
+        "context does not provide", 
+        "information is not available", 
+        "context missing", 
+        "data missing",           # <--- Catch this!
+        "not mentioned",          # <--- Catch this!
+        "not provided",           # <--- Catch this!
+        "cannot directly compare" # <--- Catch "I can't compare"
     ]
     
-    # If failed AND we haven't searched yet
+    # Check if we failed to answer fully
     if any(p in generation.lower() for p in failure_phrases):
-        if loop_count < 1: # Only retry once
-            print("   -> ANSWER FAILED. ACTIVATING WEB SEARCH RESCUE.")
+        if loop_count < 1:
+            print("   -> 🚨 Answer Incomplete. ACTIVATING WEB SEARCH RESCUE.")
             return "web_search_node"
         else:
-            print("   -> ANSWER FAILED (Retry limit reached).")
             return "end"
             
-    print("   -> ANSWER VALID.")
     return "end"
 
 def decide_to_generate(state):
@@ -218,17 +261,24 @@ def decide_to_generate(state):
     else:
         return "generate"
 
-# --- 5. GRAPH BUILD ---
+# --- 4. GRAPH BUILD ---
 workflow = StateGraph(GraphState)
 
+# Add Nodes
+workflow.add_node("decompose_query", decompose_query) # <--- NEW NODE
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("grade_documents", grade_documents)
 workflow.add_node("generate", generate)
 workflow.add_node("transform_query", transform_query)
 workflow.add_node("web_search_node", web_search_node)
 
-workflow.set_entry_point("retrieve")
+# Set Entry Point (Start with Decomposition)
+workflow.set_entry_point("decompose_query")
+
+# Edges
+workflow.add_edge("decompose_query", "retrieve")
 workflow.add_edge("retrieve", "grade_documents")
+
 workflow.add_conditional_edges(
     "grade_documents",
     decide_to_generate,
@@ -238,14 +288,10 @@ workflow.add_conditional_edges(
 workflow.add_edge("transform_query", "web_search_node")
 workflow.add_edge("web_search_node", "generate")
 
-# Connect Generate -> Validator
 workflow.add_conditional_edges(
     "generate",
     check_hallucination,
-    {
-        "web_search_node": "web_search_node",
-        "end": END
-    }
+    {"web_search_node": "web_search_node", "end": END}
 )
 
 app = workflow.compile()

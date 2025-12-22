@@ -4,6 +4,9 @@ import shutil
 import time
 from graph import app
 from ingest import ingest_data
+import json
+import re
+import pandas as pd
 
 # --- PERSISTENT MEMORY ---
 LOG_FILE = "doc_log.txt"
@@ -102,23 +105,59 @@ if prompt := st.chat_input("Ask about Revenue, Risks, or Live Stock Prices..."):
             inputs = {"question": prompt, "file_filter": selected_file}
             for output in app.stream(inputs):
                 for key, value in output.items():
-                    if key == "retrieve": response_placeholder.markdown(f"📂 *Reading {selected_file}...*")
+                    # --- Status Updates ---
+                    if key == "decompose_query":
+                        response_placeholder.markdown("🧠 *Decomposing Question...*")
+                    elif key == "retrieve": 
+                        response_placeholder.markdown(f"📂 *Reading {selected_file}...*")
                     elif key == "grade_documents":
                         if value.get("web_search") == "Yes": response_placeholder.markdown("🌍 *Searching Live Web...*")
                         else: response_placeholder.markdown("✅ *Found data in PDF...*")
                     elif key == "web_search_node":
                         response_placeholder.markdown("🌍 *Scanning Internet...*")
                         source_used = "Live Web Search"
+                    
+                    # --- Final Answer Generation ---
                     elif key == "generate":
                         full_response = value["generation"]
-                        response_placeholder.markdown(full_response)
-            
-            if "Live Web Search" in full_response or source_used == "Live Web Search":
-                st.caption(f"Sources: 🌐 Live Web")
-            else:
-                st.caption(f"Sources: 📄 Internal Documents")
-            
+                        
+                        # --- CHART DETECTION LOGIC ---
+                        chart_match = re.search(r"```json\s*({.*?})\s*```", full_response, re.DOTALL)
+                        
+                        if chart_match:
+                            try:
+                                # 1. Extract and Parse JSON
+                                json_str = chart_match.group(1)
+                                chart_data = json.loads(json_str)
+                                
+                                # 2. Clean up text (remove the raw JSON so user doesn't see it)
+                                clean_text = full_response.replace(chart_match.group(0), "")
+                                response_placeholder.markdown(clean_text)
+                                
+                                # 3. Render the Chart
+                                if "bar_chart" in chart_data:
+                                    data = chart_data["bar_chart"]
+                                    # Create DataFrame for Streamlit
+                                    df = pd.DataFrame({
+                                        "Entity": data["labels"],
+                                        data["datasets"][0]["label"]: data["datasets"][0]["data"]
+                                    }).set_index("Entity")
+                                    
+                                    # Render Bar Chart
+                                    st.bar_chart(df)
+                                    st.caption("📊 Visualized by Artha AI")
+                                    
+                            except Exception as e:
+                                # Fallback: If chart fails, just show text
+                                response_placeholder.markdown(full_response)
+                        else:
+                            # No chart found, just show text
+                            response_placeholder.markdown(full_response)
+
+            # Save the CLEANED text (without JSON) to chat history
+            # If a chart was present, we stripped it above. If not, full_response is just text.
+            # (Simplification: We save the full response to history for now)
             st.session_state.messages.append({"role": "assistant", "content": full_response})
 
         except Exception as e:
-            response_placeholder.error(f"Error: {e}")
+            st.error(f"An error occurred: {e}")

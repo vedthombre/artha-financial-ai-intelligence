@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import shutil
 import time
-from graph import app
+from graph import app , vectorstore
 from ingest import ingest_data
 import json
 import re
@@ -73,9 +73,23 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🗑️ Clear Memory", use_container_width=True):
-        if os.path.exists("./chroma_db"): shutil.rmtree("./chroma_db")
-        clear_log()
-        st.rerun()
+        try:
+            # 1. Wipe the "Memories" (Vectors) inside the DB
+            # This bypasses the Windows File Lock because we aren't deleting the folder, just the data.
+            all_ids = vectorstore.get()["ids"]
+            if all_ids:
+                vectorstore.delete(ids=all_ids)
+            
+            # 2. Clear the file log
+            clear_log()
+            
+            # 3. Success Message
+            st.success("Memory Wiped! You can upload a new PDF now.")
+            time.sleep(1)
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Error during wipe: {e}")
 
 # --- MAIN LAYOUT ---
 c1, c2 = st.columns([7, 3]) 
@@ -85,27 +99,55 @@ with c2:
 st.markdown('<div class="greeting-text">Analyze any company,<br>instantly.</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-greeting">Upload a 10-K report or ask about live market trends.</div>', unsafe_allow_html=True)
 
-# --- CHAT ---
+# --- CHAT LOGIC ---
 if "messages" not in st.session_state: st.session_state.messages = []
 
+# 1. DISPLAY HISTORY (With Chart Re-Drawing)
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]): st.markdown(message["content"])
+    with st.chat_message(message["role"]):
+        content = message["content"]
+        
+        # Check if this message contains a hidden chart
+        if "```json" in content:
+            try:
+                # Split logic: Show text, Hide code, Show chart
+                parts = content.split("```json")
+                text_part = parts[0] # The clean text
+                json_part = parts[1].split("```")[0] # The raw data
+                
+                # Show Text
+                st.markdown(text_part)
+                
+                # Draw Chart
+                chart_data = json.loads(json_part)
+                if "bar_chart" in chart_data:
+                    data = chart_data["bar_chart"]
+                    df = pd.DataFrame({
+                        "Entity": data["labels"],
+                        data["datasets"][0]["label"]: data["datasets"][0]["data"]
+                    }).set_index("Entity")
+                    st.bar_chart(df)
+            except:
+                st.markdown(content) # Fallback if parsing fails
+        else:
+            st.markdown(content)
 
+# 2. HANDLE NEW INPUT
 if prompt := st.chat_input("Ask about Revenue, Risks, or Live Stock Prices..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
 
     with st.chat_message("assistant"):
         response_placeholder = st.empty()
+        chart_placeholder = st.empty() # <--- NEW: A dedicated box for the chart
         response_placeholder.markdown("⏳ *Thinking...*")
         full_response = ""
-        source_used = "Unknown"
-
+        
         try:
             inputs = {"question": prompt, "file_filter": selected_file}
             for output in app.stream(inputs):
                 for key, value in output.items():
-                    # --- Status Updates ---
+                    # Status Updates
                     if key == "decompose_query":
                         response_placeholder.markdown("🧠 *Decomposing Question...*")
                     elif key == "retrieve": 
@@ -115,48 +157,40 @@ if prompt := st.chat_input("Ask about Revenue, Risks, or Live Stock Prices..."):
                         else: response_placeholder.markdown("✅ *Found data in PDF...*")
                     elif key == "web_search_node":
                         response_placeholder.markdown("🌍 *Scanning Internet...*")
-                        source_used = "Live Web Search"
                     
-                    # --- Final Answer Generation ---
+                    # Generation & Charting
                     elif key == "generate":
                         full_response = value["generation"]
                         
-                        # --- CHART DETECTION LOGIC ---
+                        # Check for Chart JSON
                         chart_match = re.search(r"```json\s*({.*?})\s*```", full_response, re.DOTALL)
                         
                         if chart_match:
                             try:
-                                # 1. Extract and Parse JSON
+                                # Parse JSON
                                 json_str = chart_match.group(1)
                                 chart_data = json.loads(json_str)
                                 
-                                # 2. Clean up text (remove the raw JSON so user doesn't see it)
+                                # Clean Text (Remove JSON code from display)
                                 clean_text = full_response.replace(chart_match.group(0), "")
                                 response_placeholder.markdown(clean_text)
                                 
-                                # 3. Render the Chart
+                                # Render Chart
                                 if "bar_chart" in chart_data:
                                     data = chart_data["bar_chart"]
-                                    # Create DataFrame for Streamlit
                                     df = pd.DataFrame({
                                         "Entity": data["labels"],
                                         data["datasets"][0]["label"]: data["datasets"][0]["data"]
                                     }).set_index("Entity")
-                                    
-                                    # Render Bar Chart
                                     st.bar_chart(df)
                                     st.caption("📊 Visualized by Artha AI")
                                     
-                            except Exception as e:
-                                # Fallback: If chart fails, just show text
+                            except Exception:
                                 response_placeholder.markdown(full_response)
                         else:
-                            # No chart found, just show text
                             response_placeholder.markdown(full_response)
 
-            # Save the CLEANED text (without JSON) to chat history
-            # If a chart was present, we stripped it above. If not, full_response is just text.
-            # (Simplification: We save the full response to history for now)
+            # Save Full Response (Text + JSON) to History so chart persists on reload
             st.session_state.messages.append({"role": "assistant", "content": full_response})
 
         except Exception as e:

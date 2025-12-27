@@ -1,5 +1,7 @@
 # Ignore API Keys
 .env
+venv/
+.venv/
 
 # Ignore Python Cache
 __pycache__/
@@ -9,3 +11,6 @@ __pycache__/
 chroma_db/
 temp_pdf/
 doc_log.txt
+
+
+.ipynb_checkpoints/

@@ -1,12 +1,19 @@
 import streamlit as st
 import os
-import shutil
 import time
 from graph import app , vectorstore
 from ingest import ingest_data
 import json
 import re
 import pandas as pd
+
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 # --- PERSISTENT MEMORY ---
 LOG_FILE = "doc_log.txt"

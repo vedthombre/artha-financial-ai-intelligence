@@ -4,8 +4,10 @@ langchain-groq
 langchain-community
 langchain-chroma
 langchain-huggingface
+langchain-tavily
+langchain-text-splitters
 chromadb
 python-dotenv
-tavily-python
 pandas
 pypdf
+pytest

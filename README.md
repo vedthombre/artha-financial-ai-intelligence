@@ -72,7 +72,7 @@ cd artha-financial-ai-intelligence
 ``` bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 **3.Inject API Credentials** 
 Create a .env file to authenticate the inference and search engines: 

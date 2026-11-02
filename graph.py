@@ -1,18 +1,16 @@
-import os
 from dotenv import load_dotenv
 
 # --- IMPORTS ---
 from langchain_groq import ChatGroq
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import END, StateGraph
-from typing import List, TypedDict, Optional
-from pydantic import BaseModel, Field
+from typing import List, TypedDict
 
 
 
@@ -28,11 +26,12 @@ class GraphState(TypedDict):
     documents: List[Document]
     file_filter: str
     loop_count: int
+    document_only: bool
 
 # --- 2. SETUP ---
 print("--- INITIALIZING AGENT (Phase 1: Decomposition) ---")
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
 
 vectorstore = Chroma(
     persist_directory="./chroma_db", 
@@ -40,7 +39,7 @@ vectorstore = Chroma(
     collection_name="rag-chroma"
 )
 
-web_search_tool = TavilySearchResults(k=3)
+web_search_tool = TavilySearch(max_results=3)
 
 # --- 3. NODES ---
 
@@ -50,6 +49,8 @@ def decompose_query(state):
     """
     print("---DECOMPOSE QUERY---")
     question = state["question"]
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string")
     
     parser = JsonOutputParser()
     prompt = ChatPromptTemplate.from_template(
@@ -80,7 +81,8 @@ def decompose_query(state):
         result = chain.invoke({"question": question})
         sub_queries = result.get("queries", [question])
         print(f"   -> Generated Sub-Queries: {sub_queries}")
-    except:
+    except (ValueError, TypeError, KeyError) as exc:
+        print(f"   -> Query decomposition failed; using original question: {exc}")
         sub_queries = [question]
         
     return {"sub_queries": sub_queries, "question": question}
@@ -95,7 +97,10 @@ def retrieve(state):
     loop_count = state.get("loop_count", 0)
     
     all_documents = []
-    k_per_query = 5 # Number of docs to retrieve per sub-query 
+    # A broad multi-metric query can rank intervening discussion chunks ahead of
+    # the financial statement. Fetch enough candidates for deduplication to
+    # preserve the statement even when a source has been ingested repeatedly.
+    k_per_query = 10
     
     for query in sub_queries:
         print(f"   -> Searching for: '{query}'")
@@ -120,24 +125,53 @@ def grade_documents(state):
     print("---CHECK RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
+    document_only = is_document_only_request(question)
     
     # If we have NO docs, definitely search web
     if not documents:
-        print("   -> No docs found. Web Search needed.")
-        return {"documents": [], "web_search": "Yes"}
+        print(
+            "   -> No docs found. "
+            + ("Web search disabled by request." if document_only else "Web search needed.")
+        )
+        return {"documents": [], "web_search": "No" if document_only else "Yes", "document_only": document_only}
 
     # Quick check for live data requests
     web_search = "No"
     if "live" in question.lower() or "stock price" in question.lower() or "today" in question.lower():
          web_search = "Yes"
              
-    return {"documents": documents, "question": question, "web_search": web_search}
+    if document_only:
+        web_search = "No"
+    return {
+        "documents": documents,
+        "question": question,
+        "web_search": web_search,
+        "document_only": document_only,
+    }
+
+
+def is_document_only_request(question: str) -> bool:
+    """Return whether the user explicitly forbids web search."""
+    normalized = " ".join(question.lower().split())
+    return any(
+        phrase in normalized
+        for phrase in (
+            "use only the uploaded document",
+            "use only the provided document",
+            "use only uploaded documents",
+            "do not use web search",
+            "don't use web search",
+            "without web search",
+        )
+    )
 
 
 
 def transform_query(state):
     print("---TRANSFORM QUERY---")
     question = state["question"]
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string")
     
     # 1. STRICT SYSTEM PROMPT
     system_prompt = """You are a Search Query Optimizer.
@@ -156,6 +190,8 @@ def transform_query(state):
     
     # Use LangChain invoke instead of raw client
     response = llm.invoke(messages)
+    if not isinstance(response.content, str) or not response.content.strip():
+        raise ValueError("query optimizer returned an empty response")
     better_question = response.content.strip()
 
     # 3. THE SAFETY NET
@@ -169,7 +205,6 @@ def transform_query(state):
 def web_search_node(state):
     print("---WEB SEARCH---")
     question = state["question"]
-    documents = state.get("documents", [])
     loop_count = state.get("loop_count", 0)
     
     try:
@@ -246,24 +281,14 @@ def generate(state):
       - NEVER output raw table numbers without converting to Billions (B) or Millions (M).
     
     ### INSTRUCTIONS:
-    You are answering questions based on Internal Documents (Microsoft) and Web Search Results (NVIDIA).
+    You are answering questions based on the supplied internal documents and, when allowed,
+    optional live web search results.
     
-    **YOU MUST USE THIS EXACT RESPONSE FORMAT:**
-    
-    **1. Internal Data Analysis**
-    - State the Microsoft data found in the internal PDF.
-    - Explicitly write: "NVIDIA 2024 data is not available in the provided internal context."
-    
-    **2. Action Taken**
-    - Write exactly: "To get NVIDIA 2024 data, a web search was performed."
-    
-    **3. Web Search Findings**
-    - State the data found from the web search.
-    - "The web search results from the 10-K report indicate: NVIDIA Fiscal Year 2024 Revenue was [Insert Amount]."
-    
-    **4. Final Comparison**
-    - Show the side-by-side comparison.
-    - Normalize the units (convert millions to billions if needed) so they match.
+    ### RESPONSE STRUCTURE:
+    - Clearly state the relevant findings from the supplied context.
+    - Distinguish internal document data from live web data when both are present.
+    - If a web search was used, briefly state why and summarize its findings.
+    - For comparisons, show the entities side by side and normalize their units.
     
     ### CRITICAL RULES:
     - Do NOT use "Source A" or "Source B".
@@ -271,19 +296,16 @@ def generate(state):
     
 
     ### CRITICAL DATE HANDLING:
-    - Companies like NVIDIA and Microsoft have weird Fiscal Years.
-    - **ALWAYS** specify the "Fiscal Year End Date" next to the year to avoid confusion.
-    - Example: Instead of saying "NVIDIA 2024 Revenue was $60.9B", say:
-      "NVIDIA Fiscal Year 2024 (ended Jan 28, 2024) Revenue was $60.9B."
+    - When a fiscal year end date is available in the context, include it next to the year.
     
 
     ### VISUALIZATION REQUEST:
     If the answer involves comparing numbers (e.g., Revenue A vs B) or trends (e.g., 2022-2024),
     you MUST append a JSON block at the very end.
 
-    ###context rescue logic :
-    If the answer seems incomplete or indicates missing data, you MUST trigger a web search rescue by indicating so in your response.
-    and if live web data is available, report data is missiong only if both internal and web data lack the info.
+    ### CONTEXT RESCUE LOGIC:
+    If the answer seems incomplete, state which requested information is absent from the
+    supplied context. Do not invent values or imply that a web search was performed.
 
     Format exactly like this:
     ```json
@@ -310,6 +332,8 @@ def check_hallucination(state):
     print("---CHECK VALIDITY---")
     generation = state["generation"]
     loop_count = state.get("loop_count", 0)
+    if state.get("document_only", False):
+        return "end"
     
     gen_lower = generation.lower()
     
